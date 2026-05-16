@@ -1,74 +1,35 @@
-from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
-import json
 import os
+import requests
+from datetime import datetime, timedelta, timezone
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-LICENSE_DB = "licenses.json"
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "degistir")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")
+
+TABLE = "licenses"
 
 
-def load_licenses():
-    if not os.path.exists(LICENSE_DB):
-        return {}
+def supabase_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
 
-    with open(LICENSE_DB, "r", encoding="utf-8") as f:
-        return json.load(f)
 
-
-def save_licenses(data):
-    with open(LICENSE_DB, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+def table_url():
+    return f"{SUPABASE_URL}/rest/v1/{TABLE}"
 
 
 @app.route("/")
 def home():
-    return jsonify({"status": "Onfroy License Server Online"})
-
-
-@app.route("/check_license", methods=["POST"])
-def check_license():
-    data = request.json or {}
-
-    key = data.get("license_key", "").strip()
-    device_id = data.get("device_id", "").strip()
-
-    licenses = load_licenses()
-
-    if key not in licenses:
-        return jsonify({"valid": False, "reason": "Lisans bulunamadı"})
-
-    lic = licenses[key]
-
-    if not lic.get("active", True):
-        return jsonify({"valid": False, "reason": "Lisans pasif"})
-
-    expires_at = lic.get("expires_at")
-    expires = datetime.strptime(expires_at, "%Y-%m-%d")
-
-    if datetime.now() > expires:
-        return jsonify({
-            "valid": False,
-            "reason": "Lisans süresi doldu",
-            "expires_at": expires_at
-        })
-
-    if not lic.get("device_id"):
-        lic["device_id"] = device_id
-        licenses[key] = lic
-        save_licenses(licenses)
-
-    if lic.get("device_id") != device_id:
-        return jsonify({"valid": False, "reason": "Lisans başka cihaza bağlı"})
-
-    remaining_days = (expires - datetime.now()).days
-
     return jsonify({
-        "valid": True,
-        "customer": lic.get("customer", "Müşteri"),
-        "expires_at": expires_at,
-        "remaining_days": remaining_days
+        "status": "Onfroy License Server Online",
+        "database": "Supabase"
     })
 
 
@@ -77,63 +38,186 @@ def create_license():
     data = request.json or {}
 
     if data.get("admin_secret") != ADMIN_SECRET:
-        return jsonify({"success": False, "error": "Yetkisiz"})
+        return jsonify({
+            "success": False,
+            "error": "Yetkisiz işlem"
+        }), 403
 
-    key = data.get("license_key")
-    customer = data.get("customer", "Müşteri")
+    license_key = data.get("license_key", "").strip()
+    customer = data.get("customer", "").strip()
+    contact = data.get("contact", "").strip()
     days = int(data.get("days", 30))
 
-    expires_at = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+    if not license_key or not customer:
+        return jsonify({
+            "success": False,
+            "error": "license_key ve customer zorunlu"
+        }), 400
 
-    licenses = load_licenses()
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(days=days)
+    ).isoformat()
 
-    licenses[key] = {
+    payload = {
+        "license_key": license_key,
         "customer": customer,
+        "contact": contact,
         "expires_at": expires_at,
-        "device_id": "",
-        "active": True
+        "status": "active"
     }
 
-    save_licenses(licenses)
+    r = requests.post(
+        table_url(),
+        headers=supabase_headers(),
+        json=payload,
+        timeout=20
+    )
+
+    if r.status_code not in [200, 201]:
+        return jsonify({
+            "success": False,
+            "error": r.text
+        }), 500
 
     return jsonify({
         "success": True,
-        "license_key": key,
+        "license_key": license_key,
         "customer": customer,
         "expires_at": expires_at
     })
 
 
-@app.route("/extend_license", methods=["POST"])
-def extend_license():
+@app.route("/verify_license", methods=["POST"])
+def verify_license():
     data = request.json or {}
 
-    if data.get("admin_secret") != ADMIN_SECRET:
-        return jsonify({"success": False, "error": "Yetkisiz"})
+    license_key = data.get("license_key", "").strip()
+    device_id = data.get("device_id", "").strip()
 
-    key = data.get("license_key")
-    days = int(data.get("days", 30))
+    if not license_key:
+        return jsonify({
+            "success": False,
+            "active": False,
+            "error": "Lisans kodu boş"
+        }), 400
 
-    licenses = load_licenses()
+    r = requests.get(
+        table_url(),
+        headers=supabase_headers(),
+        params={
+            "license_key": f"eq.{license_key}",
+            "select": "*"
+        },
+        timeout=20
+    )
 
-    if key not in licenses:
-        return jsonify({"success": False, "error": "Lisans bulunamadı"})
+    if r.status_code != 200:
+        return jsonify({
+            "success": False,
+            "active": False,
+            "error": r.text
+        }), 500
 
-    current_expiry = datetime.strptime(licenses[key]["expires_at"], "%Y-%m-%d")
+    rows = r.json()
 
-    if current_expiry < datetime.now():
-        current_expiry = datetime.now()
+    if not rows:
+        return jsonify({
+            "success": False,
+            "active": False,
+            "error": "Lisans bulunamadı"
+        }), 404
 
-    new_expiry = current_expiry + timedelta(days=days)
+    license_data = rows[0]
 
-    licenses[key]["expires_at"] = new_expiry.strftime("%Y-%m-%d")
+    if license_data.get("status") != "active":
+        return jsonify({
+            "success": True,
+            "active": False,
+            "error": "Lisans pasif"
+        })
 
-    save_licenses(licenses)
+    expires_at = datetime.fromisoformat(
+        license_data["expires_at"].replace("Z", "+00:00")
+    )
+
+    now = datetime.now(timezone.utc)
+
+    if expires_at < now:
+        return jsonify({
+            "success": True,
+            "active": False,
+            "error": "Lisans süresi dolmuş",
+            "expires_at": license_data["expires_at"]
+        })
+
+    saved_device = license_data.get("device_id")
+
+    if saved_device and device_id and saved_device != device_id:
+        return jsonify({
+            "success": True,
+            "active": False,
+            "error": "Bu lisans başka cihazda aktif"
+        })
+
+    if not saved_device and device_id:
+        requests.patch(
+            table_url(),
+            headers=supabase_headers(),
+            params={
+                "license_key": f"eq.{license_key}"
+            },
+            json={
+                "device_id": device_id,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            },
+            timeout=20
+        )
+
+    remaining_days = max(
+        0,
+        (expires_at - now).days
+    )
 
     return jsonify({
         "success": True,
-        "license_key": key,
-        "expires_at": licenses[key]["expires_at"]
+        "active": True,
+        "customer": license_data.get("customer"),
+        "contact": license_data.get("contact"),
+        "expires_at": license_data.get("expires_at"),
+        "remaining_days": remaining_days,
+        "device_id": saved_device or device_id
+    })
+
+
+@app.route("/list_licenses", methods=["POST"])
+def list_licenses():
+    data = request.json or {}
+
+    if data.get("admin_secret") != ADMIN_SECRET:
+        return jsonify({
+            "success": False,
+            "error": "Yetkisiz işlem"
+        }), 403
+
+    r = requests.get(
+        table_url(),
+        headers=supabase_headers(),
+        params={
+            "select": "*",
+            "order": "created_at.desc"
+        },
+        timeout=20
+    )
+
+    if r.status_code != 200:
+        return jsonify({
+            "success": False,
+            "error": r.text
+        }), 500
+
+    return jsonify({
+        "success": True,
+        "licenses": r.json()
     })
 
 
@@ -142,15 +226,77 @@ def disable_license():
     data = request.json or {}
 
     if data.get("admin_secret") != ADMIN_SECRET:
-        return jsonify({"success": False, "error": "Yetkisiz"})
+        return jsonify({
+            "success": False,
+            "error": "Yetkisiz işlem"
+        }), 403
 
-    key = data.get("license_key")
-    licenses = load_licenses()
+    license_key = data.get("license_key", "").strip()
 
-    if key not in licenses:
-        return jsonify({"success": False, "error": "Lisans bulunamadı"})
+    r = requests.patch(
+        table_url(),
+        headers=supabase_headers(),
+        params={
+            "license_key": f"eq.{license_key}"
+        },
+        json={
+            "status": "disabled",
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        },
+        timeout=20
+    )
 
-    licenses[key]["active"] = False
-    save_licenses(licenses)
+    if r.status_code not in [200, 204]:
+        return jsonify({
+            "success": False,
+            "error": r.text
+        }), 500
 
-    return jsonify({"success": True, "message": "Lisans pasifleştirildi"})
+    return jsonify({
+        "success": True,
+        "message": "Lisans devre dışı bırakıldı"
+    })
+
+
+@app.route("/reset_device", methods=["POST"])
+def reset_device():
+    data = request.json or {}
+
+    if data.get("admin_secret") != ADMIN_SECRET:
+        return jsonify({
+            "success": False,
+            "error": "Yetkisiz işlem"
+        }), 403
+
+    license_key = data.get("license_key", "").strip()
+
+    r = requests.patch(
+        table_url(),
+        headers=supabase_headers(),
+        params={
+            "license_key": f"eq.{license_key}"
+        },
+        json={
+            "device_id": None,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        },
+        timeout=20
+    )
+
+    if r.status_code not in [200, 204]:
+        return jsonify({
+            "success": False,
+            "error": r.text
+        }), 500
+
+    return jsonify({
+        "success": True,
+        "message": "Cihaz ID sıfırlandı"
+    })
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 5000))
+    )
